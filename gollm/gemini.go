@@ -524,14 +524,43 @@ func (r *GeminiCandidate) String() string {
 	return response.String()
 }
 
+// Parts returns the parts of the candidate.
 func (r *GeminiCandidate) Parts() []Part {
-	if r.candidate.Content == nil {
-		return nil
+	var parts []Part
+	if r.candidate.Content != nil {
+		for _, part := range r.candidate.Content.Parts {
+			parts = append(parts, &GeminiPart{part: *part})
+		}
 	}
-
-	parts := make([]Part, len(r.candidate.Content.Parts))
-
 	return parts
+}
+
+// GeminiPart is a part of a candidate.
+// It implements the Part interface.
+type GeminiPart struct {
+	part genai.Part
+}
+
+// AsText returns the text of the part.
+func (p *GeminiPart) AsText() (string, bool) {
+	if p.part.Text != "" {
+		return p.part.Text, true
+	}
+	return "", false
+}
+
+// AsFunctionCalls returns the function calls of the part.
+func (p *GeminiPart) AsFunctionCalls() ([]FunctionCall, bool) {
+	if p.part.FunctionCall != nil {
+		return []FunctionCall{
+			{
+				ID:        p.part.FunctionCall.ID,
+				Name:      p.part.FunctionCall.Name,
+				Arguments: p.part.FunctionCall.Args,
+			},
+		}, true
+	}
+	return nil, false
 }
 
 type GeminiCompletionResponse struct {

@@ -16,6 +16,7 @@ package gollm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -201,8 +202,13 @@ func (c *AzureOpenAIClient) SetResponseSchema(schema *Schema) error {
 }
 
 func (c *AzureOpenAIClient) StartChat(systemPrompt string, model string) Chat {
-	var a Chat
-	return a
+	return &AzureOpenAIChat{
+		client: c.client,
+		model:  model,
+		history: []azopenai.ChatRequestMessageClassification{
+			&azopenai.ChatRequestSystemMessage{Content: azopenai.NewChatRequestSystemMessageContent(systemPrompt)},
+		},
+	}
 }
 
 type AzureOpenAICompletionResponse struct {
@@ -215,4 +221,201 @@ func (r *AzureOpenAICompletionResponse) Response() string {
 
 func (r *AzureOpenAICompletionResponse) UsageMetadata() any {
 	return nil
+}
+
+type AzureOpenAIChat struct {
+	client  *azopenai.Client
+	model   string
+	history []azopenai.ChatRequestMessageClassification
+	tools   []azopenai.ChatCompletionsToolDefinitionClassification
+}
+
+func (c *AzureOpenAIChat) Send(ctx context.Context, contents ...any) (ChatResponse, error) {
+	for _, content := range contents {
+		switch v := content.(type) {
+		case string:
+			message := azopenai.ChatRequestUserMessage{
+				Content: azopenai.NewChatRequestUserMessageContent(v),
+			}
+			c.history = append(c.history, &message)
+		case FunctionCallResult:
+			message := azopenai.ChatRequestUserMessage{
+				Content: azopenai.NewChatRequestUserMessageContent(fmt.Sprintf("Function call result: %s", v.Result)),
+			}
+			c.history = append(c.history, &message)
+		default:
+			return nil, fmt.Errorf("unsupported content type: %T", v)
+		}
+	}
+
+	resp, err := c.client.GetChatCompletions(ctx, azopenai.ChatCompletionsOptions{
+		DeploymentName: &c.model,
+		Messages:       c.history,
+		Tools:          c.tools,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("no response from Azure OpenAI: %v", resp)
+	}
+
+	return &AzureOpenAIChatResponse{azureOpenAIResponse: resp}, nil
+}
+
+func (c *AzureOpenAIChat) IsRetryableError(err error) bool {
+	// TODO: Implement this
+	return false
+}
+
+func (c *AzureOpenAIChat) SendStreaming(ctx context.Context, contents ...any) (ChatResponseIterator, error) {
+	// TODO: Implement streaming
+	response, err := c.Send(ctx, contents...)
+	if err != nil {
+		return nil, err
+	}
+	return singletonChatResponseIterator(response), nil
+}
+
+type AzureOpenAIChatResponse struct {
+	azureOpenAIResponse azopenai.GetChatCompletionsResponse
+}
+
+var _ ChatResponse = &AzureOpenAIChatResponse{}
+
+func (r *AzureOpenAIChatResponse) MarshalJSON() ([]byte, error) {
+	formatted := RecordChatResponse{
+		Raw: r.azureOpenAIResponse,
+	}
+	return json.Marshal(&formatted)
+}
+
+func (r *AzureOpenAIChatResponse) String() string {
+	return fmt.Sprintf("AzureOpenAIChatResponse{candidates=%v}", r.azureOpenAIResponse.Choices)
+}
+
+func (r *AzureOpenAIChatResponse) UsageMetadata() any {
+	return r.azureOpenAIResponse.Usage
+}
+
+func (r *AzureOpenAIChatResponse) Candidates() []Candidate {
+	var candidates []Candidate
+	for _, candidate := range r.azureOpenAIResponse.Choices {
+		candidates = append(candidates, &AzureOpenAICandidate{candidate: candidate})
+	}
+	return candidates
+}
+
+type AzureOpenAICandidate struct {
+	candidate azopenai.ChatChoice
+}
+
+func (r *AzureOpenAICandidate) String() string {
+	var response strings.Builder
+	response.WriteString("[")
+	for i, parts := range r.Parts() {
+		if i > 0 {
+			response.WriteString(", ")
+		}
+		text, ok := parts.AsText()
+		if ok {
+			response.WriteString(text)
+		}
+		functionCalls, ok := parts.AsFunctionCalls()
+		if ok {
+			response.WriteString("functionCalls=[")
+			for _, functionCall := range functionCalls {
+				response.WriteString(fmt.Sprintf("%q(args=%v)", functionCall.Name, functionCall.Arguments))
+			}
+			response.WriteString("]}")
+		}
+	}
+	response.WriteString("]}")
+	return response.String()
+}
+
+func (r *AzureOpenAICandidate) Parts() []Part {
+	var parts []Part
+
+	if r.candidate.Message != nil {
+		parts = append(parts, &AzureOpenAIPart{
+			text: r.candidate.Message.Content,
+		})
+	}
+
+	for _, tool := range r.candidate.Message.ToolCalls {
+		if tool == nil {
+			continue
+		}
+		parts = append(parts, &AzureOpenAIPart{
+			functionCall: tool.(*azopenai.ChatCompletionsFunctionToolCall).Function,
+		})
+	}
+
+	return parts
+}
+
+type AzureOpenAIPart struct {
+	text         *string
+	functionCall *azopenai.FunctionCall
+}
+
+func (p *AzureOpenAIPart) AsText() (string, bool) {
+	if p.text != nil && len(*p.text) > 0 {
+		return *p.text, true
+	}
+	return "", false
+}
+
+func (p *AzureOpenAIPart) AsFunctionCalls() ([]FunctionCall, bool) {
+	if p.functionCall != nil {
+		argumentsObj := map[string]any{}
+		err := json.Unmarshal([]byte(*p.functionCall.Arguments), &argumentsObj)
+		if err != nil {
+			return nil, false
+		}
+		functionCalls := []FunctionCall{
+			{
+				Name:      *p.functionCall.Name,
+				Arguments: argumentsObj,
+			},
+		}
+		return functionCalls, true
+	}
+	return nil, false
+}
+
+func (c *AzureOpenAIChat) SetFunctionDefinitions(functionDefinitions []*FunctionDefinition) error {
+	var tools []azopenai.ChatCompletionsToolDefinitionClassification
+	for _, functionDefinition := range functionDefinitions {
+		tools = append(tools, &azopenai.ChatCompletionsFunctionToolDefinition{Function: fnDefToAzureOpenAITool(functionDefinition)})
+	}
+	c.tools = tools
+	return nil
+}
+
+func fnDefToAzureOpenAITool(fnDef *FunctionDefinition) *azopenai.ChatCompletionsFunctionToolDefinitionFunction {
+	properties := make(map[string]any)
+	for paramName, param := range fnDef.Parameters.Properties {
+		properties[paramName] = map[string]any{
+			"type":        string(param.Type),
+			"description": param.Description,
+		}
+	}
+	parameters := map[string]any{
+		"type":       "object",
+		"properties": properties,
+	}
+	if len(fnDef.Parameters.Required) > 0 {
+		parameters["required"] = fnDef.Parameters.Required
+	}
+	jsonBytes, _ := json.Marshal(parameters)
+
+	tool := azopenai.ChatCompletionsFunctionToolDefinitionFunction{
+		Name:        &fnDef.Name,
+		Description: &fnDef.Description,
+		Parameters:  jsonBytes,
+	}
+
+	return &tool
 }
